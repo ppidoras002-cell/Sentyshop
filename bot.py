@@ -57,6 +57,7 @@ from database import (
     refund_withdrawal,
     get_payout_details,
     set_payout_details,
+    user_has_paid_order,
     REF_REWARD_RUB,
     REF_MIN_WITHDRAW_RUB,
     create_catalog,
@@ -505,17 +506,17 @@ def _button_label(default_text: str, callback_data=None, url=None) -> str:
 def _auto_button_style(text: str | None, callback_data: str | None, url: str | None) -> str | None:
     """Цвет кнопки по смыслу (Bot API style).
 
-    success  = зелёный  — купить, оплатить, подтвердить, магазин
-    primary  = синий    — навигация, инфо, рефералка
-    danger   = красный  — назад, отмена, удалить, отклонить
-    None     = прозрачная (каталоги/товары в витрине)
+    Единые правила интерфейса:
+      success  = зелёный  — действие: купить, оплатить, подтвердить, проверить оплату
+      primary  = синий    — навигация и информация
+      danger   = красный  — назад, отмена, удалить, отклонить
+      None     = прозрачная (карточки товаров в витрине)
     """
     t = (text or "").casefold()
     cb = (callback_data or "").casefold()
+    raw = text or ""
 
-    # Каталоги в витрине — фирменная синяя подсветка.
-    # Premium Emoji для каталогов здесь намеренно не добавляются: цвет кнопки
-    # должен быть способом выделения каталога, а не эмодзи.
+    # Каталоги в витрине — синяя навигация.
     catalog_prefixes = (
         "user_catalog:", "catalog_view:", "product_catalog:",
         "catalog:", "open_catalog:",
@@ -523,51 +524,59 @@ def _auto_button_style(text: str | None, callback_data: str | None, url: str | N
     if any(cb.startswith(p) for p in catalog_prefixes):
         return "primary"
 
-    # Товары остаются без специальной подсветки.
+    # Товары в витрине — без цветной подсветки.
     transparent_prefixes = (
         "user_product:", "product_view:", "open_product:",
     )
     if any(cb.startswith(p) for p in transparent_prefixes):
         return None
 
-    # Красный — негатив / назад
+    # --- Красный: назад / отмена / удаление ---
     red_text = (
         "назад", "отмен", "удал", "отклон", "бан", "выкл", "сброс",
         "закрыть", "нет", "отписка",
     )
     red_cb = (
         "back", "cancel", "delete", "reject", "ban", "remove", "reset",
-        "clear", "wd_no", "admin_reject",
+        "clear", "wd_no", "admin_reject", "payments_disabled",
     )
     if any(x in t for x in red_text) or any(x in cb for x in red_cb):
         return "danger"
-    if "⬅️" in (text or "") or "❌" in (text or "") or "🗑" in (text or ""):
+    if "⬅️" in raw or "❌" in raw or "🗑" in raw:
         return "danger"
 
-    # Зелёный — позитив / деньги / успех
+    # --- Зелёный: действие (купить / оплатить / подтвердить) ---
     green_text = (
-        "купить", "оплат", "подтверд", "магазин", "выплач", "я оплатил",
-        "проверить подписку", "крутить", "добавить", "включить", "сохранить",
-        "выдать", "создать",
+        "купить", "оплат", "подтверд", "выплач", "я оплатил",
+        "проверить оплату", "проверить подписку", "крутить",
+        "добавить", "включить", "сохранить", "выдать", "создать",
+        "пополнить",
     )
     green_cb = (
-        "shop", "buy", "pay_", "confirm", "wd_ok", "check_pay", "admin_confirm",
-        "roulette_spin", "deliver", "subscription_check",
+        "shop", "buy", "pay_", "pay_balance", "pay_rub", "pay_usdt",
+        "pay_yoomoney", "pay_sbp", "pay_rub_owner", "pay_stars_owner",
+        "stars_pay_", "topup", "confirm", "wd_ok", "check_pay",
+        "crypto_check", "sbp_check", "yoomoney_check", "admin_confirm",
+        "roulette_spin", "deliver", "subscription_check", "receipt",
     )
-    if any(x in t for x in green_text) or any(x in cb for x in green_cb):
+    if any(x in t for x in green_text) or any(cb.startswith(x) or x in cb for x in green_cb):
         return "success"
-    if "✅" in (text or "") or "💳" in (text or "") or "🟢" in (text or ""):
+    if "✅" in raw or "💳" in raw or "🟢" in raw:
+        return "success"
+    # URL «Оплатить» в CryptoBot / платёжных ссылках
+    if url and any(x in t for x in ("оплат", "pay", "invoice")):
         return "success"
 
-    # Синий — навигация / инфо (по умолчанию для остальных смысловых)
+    # --- Синий: навигация / информация ---
     blue_text = (
         "профиль", "реферал", "заказ", "поддерж", "faq", "правил", "рулетк",
         "каталог", "товар", "настрой", "статистик", "рассылк", "админ",
-        "stars", "premium", "вывод",
+        "stars", "premium", "вывод", "отзыв", "магазин",
     )
     blue_cb = (
         "profile", "referral", "orders", "support", "faq", "rules", "roulette",
-        "catalog", "product", "admin", "stars", "withdraw",
+        "catalog", "product", "admin", "stars", "withdraw", "reviews",
+        "balance_topup", "referral_menu", "referral_open",
     )
     if any(x in t for x in blue_text) or any(x in cb for x in blue_cb):
         return "primary"
@@ -577,33 +586,40 @@ def _auto_button_style(text: str | None, callback_data: str | None, url: str | N
 
 
 def InlineKeyboardButton(*args, **kwargs):
-    # Единая точка переопределения текста и Premium Emoji-иконки
+    # Единая точка переопределения текста, стиля и Premium Emoji-иконки
     # всех inline-кнопок бота. Telegram не поддерживает MessageEntity
     # внутри текста кнопки, но с Bot API 9.4 поддерживает
     # icon_custom_emoji_id — Premium Emoji слева от текста.
+    #
+    # Стили (принудительно по смыслу, даже если передали другой style):
+    #   success = зелёный — купить / оплатить / подтвердить
+    #   primary = синий   — навигация / информация
+    #   danger  = красный — назад / отмена
     callback_data = kwargs.get("callback_data")
     url = kwargs.get("url")
     button_text = kwargs.get("text") if "text" in kwargs else (args[0] if args else None)
     key = _button_key(callback_data, url, button_text)
 
-    # Каталоги — всегда синяя подсветка. Premium Emoji для них не
-    # подставляем автоматически. Товары остаются прозрачными.
     cb_str = str(callback_data or "")
     if any(cb_str.startswith(p) for p in (
         "user_catalog:", "catalog_view:", "product_catalog:",
         "catalog:", "open_catalog:",
     )):
-        # Каталоги всегда синие, но Premium Emoji каталога НЕ удаляем.
-        # Telegram поддерживает style + icon_custom_emoji_id одновременно.
+        # Каталоги всегда синие (навигация).
         kwargs["style"] = "primary"
     elif any(cb_str.startswith(p) for p in (
         "user_product:", "product_view:", "open_product:",
     )):
+        # Товары в витрине — без цветной подсветки.
         kwargs.pop("style", None)
-    elif "style" not in kwargs:
+    else:
+        # Всегда применяем семантический стиль: зелёный / синий / красный.
+        # Жёстко заданный style в вызове больше не перебивает правила.
         auto = _auto_button_style(button_text, callback_data, url)
         if auto:
             kwargs["style"] = auto
+        else:
+            kwargs.pop("style", None)
 
     if "text" in kwargs:
         kwargs["text"] = _button_label(kwargs["text"], callback_data, url)
@@ -866,7 +882,7 @@ def _ui_text_default(key: str) -> str:
         "rules": "🛡 <b>ПРАВИЛА МАГАЗИНА</b>\n\n💲 Оплата производится до выдачи товара.\n\n🌍 Товар выдаётся автоматически.\n\n📅 Возврат возможен только если товар оказался нерабочим на момент покупки. Для рассмотрения возврата обязательно нужна видеозапись покупки и проверки товара.\n\n⚙️ Перед покупкой внимательно ознакомьтесь с описанием товара и условиями выдачи.\n\n👁 Попытки обмана, подделка чеков и злоупотребления приводят к блокировке без возврата средств.\n\n📄 <b>Соглашение</b>\n\nПокупая товар в магазине, вы соглашаетесь с правилами сервиса.",
         "roulette": "🎁 <b>РУЛЕТКА</b>\n\n🎰 Испытайте удачу и получите скидку или рубли на баланс!\n\n🎁 Возможные награды: <b>5%</b>, <b>10%</b>, <b>15%</b> скидка или <b>1 ₽, 3 ₽, 5 ₽, 10 ₽, 20 ₽, 50 ₽</b> на баланс.\n\n💰 Денежная награда зачисляется автоматически.\n\nНажмите кнопку ниже, чтобы начать.",
         "subscription": "📢 <b>Для использования бота необходимо подписаться на наш канал.</b>\n\nПосле подписки нажмите «Проверить подписку».",
-        "referral": "🎁 <b>Реферальная программа</b>\n\nЗа каждого друга с <b>Telegram Premium</b>: <b>+{reward} ₽</b>\n⚠️ Без Premium начисление не идёт.\n💰 Баланс можно только вывести (не для покупок).\n🏧 Минимальный вывод: <b>{min_withdraw} ₽</b>\n\n💰 Ваш баланс: <b>{balance} ₽</b>\n👥 Приглашено: <b>{total_refs}</b>\n⭐ С Premium: <b>{premium_refs}</b>\n\n💳 Реквизиты: {payout}\n\n🔗 Ваша ссылка:\n<code>{ref_link}</code>",
+        "referral": "🎁 <b>Реферальная программа</b>\n\nЗа каждого друга с <b>Telegram Premium</b>: <b>+{reward} ₽</b>\n⚠️ Без Premium начисление не идёт.\n💰 Баланс можно только вывести (не для покупок).\n🏧 Минимальный вывод: <b>{min_withdraw} ₽</b>\n🛒 Для вывода нужен хотя бы <b>1 успешный заказ</b>.\n\n💰 Ваш баланс: <b>{balance} ₽</b>\n👥 Приглашено: <b>{total_refs}</b>\n⭐ С Premium: <b>{premium_refs}</b>\n\n💳 Реквизиты: {payout}\n\n🔗 Ваша ссылка:\n<code>{ref_link}</code>",
         "referral_card": "💳 <b>Реквизиты для вывода</b>\n\nОтправьте <b>номер карты</b> одним сообщением.\nПример: <code>2200700123456789</code>\n\nИли /cancel для отмены.",
         "referral_withdraw": "🏧 <b>Вывод реферального баланса</b>\n\nЗаявка будет создана на сохранённые реквизиты.",
         "shop": "🛍 <b>Магазин {shop_name}</b>\n\nВыберите нужный раздел:",
@@ -1030,12 +1046,14 @@ async def _get_rendered_template(key: str, default: str, values: dict) -> str:
 
 def main_menu() -> InlineKeyboardMarkup:
     d = _main_menu_defaults()
-    # Главное меню: логичная последовательность и единый цвет навигационных кнопок.
-    # Магазин — первым, рефералка — второй, поддержка — последней.
+    # Главное меню — единый стиль:
+    #   зелёный = главное действие (Магазин)
+    #   синий   = навигация (профиль, заказы, рефералка, FAQ…)
+    #   красный = только назад/отмена (здесь нет)
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text=_button_label(d["shop"], "shop"), style="success", callback_data="shop")],
-            [InlineKeyboardButton(text=_button_label(d["referral"], "referral"), style="success", callback_data="referral_menu")],
+            [InlineKeyboardButton(text=_button_label(d["referral"], "referral"), style="primary", callback_data="referral_menu")],
             [
                 InlineKeyboardButton(text=_button_label(d["profile"], "profile"), style="primary", callback_data="profile"),
                 InlineKeyboardButton(text=_button_label(d["orders"], "orders"), style="primary", callback_data="orders"),
@@ -1048,7 +1066,7 @@ def main_menu() -> InlineKeyboardMarkup:
                 InlineKeyboardButton(text=_button_label(d["faq"], "faq"), style="primary", callback_data="faq"),
                 InlineKeyboardButton(text=_button_label(d["rules_menu"], "rules_menu"), style="primary", callback_data="rules_menu"),
             ],
-            [InlineKeyboardButton(text=_button_label(d["support"], "support"), style="danger", callback_data="support")],
+            [InlineKeyboardButton(text=_button_label(d["support"], "support"), style="primary", callback_data="support")],
         ]
     )
 
@@ -2035,8 +2053,22 @@ def _payment_status(enabled: bool) -> str:
     return "🟢 ВКЛ" if enabled else "🔴 ВЫКЛ"
 
 
+def _chunk_buttons(buttons: list, per_row: int = 2) -> list[list]:
+    """Разбивает список кнопок на ряды по per_row штук (две колонки по умолчанию)."""
+    if not buttons:
+        return []
+    rows = []
+    for i in range(0, len(buttons), per_row):
+        rows.append(buttons[i : i + per_row])
+    return rows
+
+
 async def product_payment_buttons(product_id: int):
-    """Build the common payment-method keyboard for every DB product."""
+    """Build the common payment-method keyboard for every DB product.
+
+    Все способы оплаты — зелёные (действие). Стиль дополнительно
+    принудительно выставляется в InlineKeyboardButton по смыслу.
+    """
     buttons = []
     # Внутренний баланс не зависит от переключателей внешних способов оплаты.
     buttons.append(InlineKeyboardButton(
@@ -2046,38 +2078,41 @@ async def product_payment_buttons(product_id: int):
     ))
     if await is_payment_enabled("rub"):
         key = "label:pay_rub"
-        buttons.append(InlineKeyboardButton(text=_button_label("₽ RUB / Карта", callback_data=f"pay_rub:{product_id}"), style="primary", callback_data=f"pay_rub:{product_id}", icon_custom_emoji_id=_BUTTON_ICONS.get(key)))
+        buttons.append(InlineKeyboardButton(text=_button_label("₽ RUB / Карта", callback_data=f"pay_rub:{product_id}"), style="success", callback_data=f"pay_rub:{product_id}", icon_custom_emoji_id=_BUTTON_ICONS.get(key)))
     if await is_payment_enabled("rub_owner"):
         key = "label:pay_rub_owner"
-        buttons.append(InlineKeyboardButton(text=_button_label("💵 Оплата рублями", callback_data="payment_rub_owner:button"), style="primary", callback_data=f"pay_rub_owner:{product_id}", icon_custom_emoji_id=_BUTTON_ICONS.get(key)))
+        buttons.append(InlineKeyboardButton(text=_button_label("💵 Оплата рублями", callback_data="payment_rub_owner:button"), style="success", callback_data=f"pay_rub_owner:{product_id}", icon_custom_emoji_id=_BUTTON_ICONS.get(key)))
     if await is_payment_enabled("stars_owner"):
         key = "label:pay_stars_owner"
-        buttons.append(InlineKeyboardButton(text=_button_label("⭐ Оплата Stars", callback_data="payment_stars_owner:button"), style="primary", callback_data=f"pay_stars_owner:{product_id}", icon_custom_emoji_id=_BUTTON_ICONS.get(key)))
+        buttons.append(InlineKeyboardButton(text=_button_label("⭐ Оплата Stars", callback_data="payment_stars_owner:button"), style="success", callback_data=f"pay_stars_owner:{product_id}", icon_custom_emoji_id=_BUTTON_ICONS.get(key)))
     if await is_payment_enabled("sbp"):
         key = "label:pay_sbp"
-        buttons.append(InlineKeyboardButton(text=_button_label("🏦 СБП", callback_data=f"pay_yoomoney:{product_id}"), style="primary", callback_data=f"pay_yoomoney:{product_id}", icon_custom_emoji_id=_BUTTON_ICONS.get(key)))
+        buttons.append(InlineKeyboardButton(text=_button_label("🏦 СБП", callback_data=f"pay_yoomoney:{product_id}"), style="success", callback_data=f"pay_yoomoney:{product_id}", icon_custom_emoji_id=_BUTTON_ICONS.get(key)))
     if await is_payment_enabled("usdt"):
         key = "label:pay_usdt"
-        buttons.append(InlineKeyboardButton(text=_button_label("₮ USDT", callback_data=f"pay_usdt:{product_id}"), style="primary", callback_data=f"pay_usdt:{product_id}", icon_custom_emoji_id=_BUTTON_ICONS.get(key)))
+        buttons.append(InlineKeyboardButton(text=_button_label("₮ USDT", callback_data=f"pay_usdt:{product_id}"), style="success", callback_data=f"pay_usdt:{product_id}", icon_custom_emoji_id=_BUTTON_ICONS.get(key)))
     return buttons
 
 
 async def stars_payment_buttons(quantity: int, recipient: str = ""):
-    """Build payment buttons for the built-in Telegram Stars product."""
+    """Build payment buttons for the built-in Telegram Stars product.
+
+    Все способы оплаты — зелёные (действие).
+    """
     buttons = []
     buttons.append(InlineKeyboardButton(text=_button_label("💰 Оплатить с баланса", callback_data=f"stars_pay_balance:{quantity}"), style="success", callback_data=f"stars_pay_balance:{quantity}", icon_custom_emoji_id=_BUTTON_ICONS.get("label:pay_balance")))
     if await is_payment_enabled("rub"):
         key = "label:stars_pay_rub"
-        buttons.append(InlineKeyboardButton(text=_button_label("₽ Оплатить RUB", callback_data=f"stars_pay_rub:{quantity}"), style="primary", callback_data=f"stars_pay_rub:{quantity}", icon_custom_emoji_id=_BUTTON_ICONS.get(key)))
+        buttons.append(InlineKeyboardButton(text=_button_label("₽ Оплатить RUB", callback_data=f"stars_pay_rub:{quantity}"), style="success", callback_data=f"stars_pay_rub:{quantity}", icon_custom_emoji_id=_BUTTON_ICONS.get(key)))
     if await is_payment_enabled("rub_owner"):
         key = "label:pay_rub_owner"
-        buttons.append(InlineKeyboardButton(text=_button_label("💵 Оплата рублями", callback_data="payment_rub_owner:button"), style="primary", callback_data=f"stars_pay_rub_owner:{quantity}", icon_custom_emoji_id=_BUTTON_ICONS.get(key)))
+        buttons.append(InlineKeyboardButton(text=_button_label("💵 Оплата рублями", callback_data="payment_rub_owner:button"), style="success", callback_data=f"stars_pay_rub_owner:{quantity}", icon_custom_emoji_id=_BUTTON_ICONS.get(key)))
     if await is_payment_enabled("usdt"):
         key = "label:stars_pay_usdt"
-        buttons.append(InlineKeyboardButton(text=_button_label("₮ Оплатить USDT", callback_data=f"stars_pay_usdt:{quantity}:{recipient.lstrip(chr(64))}"), style="primary", callback_data=f"stars_pay_usdt:{quantity}:{recipient.lstrip(chr(64))}", icon_custom_emoji_id=_BUTTON_ICONS.get(key)))
+        buttons.append(InlineKeyboardButton(text=_button_label("₮ Оплатить USDT", callback_data=f"stars_pay_usdt:{quantity}:{recipient.lstrip(chr(64))}"), style="success", callback_data=f"stars_pay_usdt:{quantity}:{recipient.lstrip(chr(64))}", icon_custom_emoji_id=_BUTTON_ICONS.get(key)))
     if await is_payment_enabled("sbp"):
         key = "label:stars_pay_sbp"
-        buttons.append(InlineKeyboardButton(text=_button_label("🏦 Оплатить СБП", callback_data=f"stars_pay_yoomoney:{quantity}"), style="primary", callback_data=f"stars_pay_yoomoney:{quantity}", icon_custom_emoji_id=_BUTTON_ICONS.get(key)))
+        buttons.append(InlineKeyboardButton(text=_button_label("🏦 Оплатить СБП", callback_data=f"stars_pay_yoomoney:{quantity}"), style="success", callback_data=f"stars_pay_yoomoney:{quantity}", icon_custom_emoji_id=_BUTTON_ICONS.get(key)))
     return buttons
 
 
@@ -5846,7 +5881,7 @@ async def stars_quantity(message: Message, state: FSMContext):
     discount_line = f"\n🎁 Скидка: <b>{discount}%</b>" if discount else ""
 
     payment_buttons = await stars_payment_buttons(quantity, recipient)
-    rows = [[button] for button in payment_buttons]
+    rows = _chunk_buttons(payment_buttons, 2)
     if not payment_buttons:
         no_payment_notice = True
     else:
@@ -6330,11 +6365,10 @@ async def user_product(callback: CallbackQuery):
         is_robux = "robux" in catalog_l or "roblox" in catalog_l or "robux" in name_l
         if is_robux:
             buy_buttons = await product_payment_buttons(product_id)
-            keyboard_rows = []
             if buy_buttons:
-                keyboard_rows.append(buy_buttons)
+                keyboard_rows = _chunk_buttons(buy_buttons, 2)
             else:
-                keyboard_rows.append([InlineKeyboardButton(text="⛔ Оплата временно отключена", style="danger", callback_data="payments_disabled")])
+                keyboard_rows = [[InlineKeyboardButton(text="⛔ Оплата временно отключена", style="danger", callback_data="payments_disabled")]]
         else:
             keyboard_rows = [[InlineKeyboardButton(text="💳 Купить", style="success", callback_data=f"buy:{product_id}")]]
 
@@ -6424,7 +6458,7 @@ async def buy_product(
     if not payment_buttons:
         text += "\n\n⛔ <b>Все способы оплаты временно отключены.</b>"
 
-    keyboard_rows = [[button] for button in payment_buttons]
+    keyboard_rows = _chunk_buttons(payment_buttons, 2)
     keyboard_rows.append([InlineKeyboardButton(text="⬅️ Назад", style="danger", callback_data=f"user_product:{product_id}")])
     keyboard = InlineKeyboardMarkup(inline_keyboard=keyboard_rows)
 
@@ -8731,6 +8765,14 @@ async def referral_save_card(message: Message, state: FSMContext):
 
 @dp.callback_query(F.data == "referral_withdraw")
 async def referral_withdraw_start(callback: CallbackQuery, state: FSMContext):
+    # Сначала проверяем, что пользователь сделал хотя бы одну подтверждённую покупку
+    if not await user_has_paid_order(callback.from_user.id):
+        await callback.answer(
+            "Для вывода нужен хотя бы один успешный заказ (подтверждённый администратором).",
+            show_alert=True,
+        )
+        return
+
     balance = await get_referral_balance(callback.from_user.id)
     if balance < REF_MIN_WITHDRAW_RUB:
         await callback.answer(

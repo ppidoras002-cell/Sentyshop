@@ -1230,7 +1230,25 @@ async def consume_roulette_discount(telegram_id: int):
 # ============================================================
 
 REF_REWARD_RUB = 50.0
-REF_MIN_WITHDRAW_RUB = 150.0
+REF_MIN_WITHDRAW_RUB = 300.0
+
+
+async def user_has_paid_order(telegram_id: int) -> bool:
+    """True if the user has at least one order with status 'paid' (admin-confirmed)."""
+    async with aiosqlite.connect(DB_NAME) as db:
+        cursor = await db.execute(
+            """
+            SELECT 1
+            FROM orders
+            JOIN users ON orders.user_id = users.id
+            WHERE users.telegram_id = ?
+              AND orders.status = 'paid'
+            LIMIT 1
+            """,
+            (telegram_id,),
+        )
+        row = await cursor.fetchone()
+        return row is not None
 
 
 async def get_referral_balance(telegram_id: int) -> float:
@@ -1342,6 +1360,10 @@ async def create_withdrawal_request(
     amount: float,
     details: str,
 ) -> tuple[bool, str, int | None]:
+    # Требуем хотя бы один подтверждённый заказ (status=paid)
+    if not await user_has_paid_order(telegram_id):
+        return False, "Для вывода нужен хотя бы один успешный заказ (подтверждённый администратором).", None
+
     async with aiosqlite.connect(DB_NAME) as db:
         cursor = await db.execute(
             "SELECT COALESCE(referral_balance, 0) FROM users WHERE telegram_id = ?",
